@@ -1,14 +1,16 @@
 use crate::canonical::canonical_json;
-use crate::{BrowserProbe, HttpObservation, TlsObservation};
+use crate::{
+    BrowserProbe, Http1WireObservation, Http2Observation, HttpObservation, QuicObservation,
+    TcpObservation, TlsObservation,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-fn sha256_hex(data: impl AsRef<[u8]>) -> String {
+pub fn sha256_hex(data: impl AsRef<[u8]>) -> String {
     let mut digest = Sha256::new();
     digest.update(data.as_ref());
     hex::encode(digest.finalize())
 }
-
 
 fn is_grease(value: u16) -> bool {
     let high = (value >> 8) as u8;
@@ -35,6 +37,7 @@ pub fn fingerprint_tls_stable(tls: &TlsObservation) -> String {
         .iter()
         .copied()
         .filter(|value| !is_grease(*value))
+        .filter(|value| !matches!(*value, 0x0015 | 0x0029))
         .collect::<Vec<_>>();
     extensions.sort_unstable();
     extensions.dedup();
@@ -54,11 +57,52 @@ pub fn fingerprint_tls_stable(tls: &TlsObservation) -> String {
         "extensions": extensions,
         "supported_groups": groups,
         "signature_algorithms": tls.signature_algorithms,
+        "signature_algorithms_cert": tls.signature_algorithms_cert,
+        "certificate_compression_algorithms": tls.certificate_compression_algorithms,
+        "psk_key_exchange_modes": tls.psk_key_exchange_modes,
         "alpn": tls.alpn,
         "sni_present": tls.sni.is_some(),
+        "ech": tls.has_ech,
+        "alps": tls.has_alps,
     });
 
     format!("ztls1_{}", short_hash(&value))
+}
+
+pub fn fingerprint_tls_wire(tls: &TlsObservation) -> String {
+    let value = json!({
+        "legacy_version": tls.legacy_version,
+        "supported_versions": tls.supported_versions,
+        "cipher_suites": tls.cipher_suites,
+        "extensions": tls.extension_details,
+        "groups": tls.supported_groups,
+        "signature_algorithms": tls.signature_algorithms,
+        "key_share_groups": tls.key_share_groups,
+        "alpn": tls.alpn,
+        "session_id_len": tls.session_id_len,
+        "record_count": tls.record_count,
+        "client_hello_len": tls.client_hello_len,
+    });
+
+    format!("ztlsw1_{}", short_hash(&value))
+}
+
+pub fn fingerprint_tcp(tcp: &TcpObservation) -> String {
+    let value = json!({
+        "ip_version": tcp.ip_version,
+        "ttl": tcp.ttl,
+        "hop_limit": tcp.hop_limit,
+        "window_size": tcp.window_size,
+        "mss": tcp.mss,
+        "window_scale": tcp.window_scale,
+        "sack": tcp.sack_permitted,
+        "timestamps": tcp.timestamps,
+        "ecn": tcp.ecn,
+        "options_order": tcp.options_order,
+        "syn_payload_len": tcp.syn_payload_len,
+    });
+
+    format!("ztcp1_{}", short_hash(&value))
 }
 
 pub fn fingerprint_http(http: &HttpObservation) -> String {
@@ -79,9 +123,62 @@ pub fn fingerprint_http(http: &HttpObservation) -> String {
     format!("zhttp1_{}", short_hash(&value))
 }
 
+pub fn fingerprint_http1_wire(http: &Http1WireObservation) -> String {
+    let value = json!({
+        "request_line": http.request_line,
+        "header_names": http.header_names,
+        "header_count": http.header_count,
+        "header_bytes": http.header_bytes,
+    });
+
+    format!("zh1w1_{}", short_hash(&value))
+}
+
+pub fn fingerprint_http2(http2: &Http2Observation) -> String {
+    let frame_shape = http2
+        .first_frames
+        .iter()
+        .take(16)
+        .map(|frame| json!([frame.frame_type, frame.flags, frame.stream_id == 0, frame.length]))
+        .collect::<Vec<_>>();
+
+    let value = json!({
+        "settings": http2.settings,
+        "connection_window_update": http2.connection_window_update,
+        "frame_shape": frame_shape,
+    });
+
+    format!("zh2_{}", short_hash(&value))
+}
+
+pub fn fingerprint_quic(quic: &QuicObservation) -> String {
+    let value = json!({
+        "version": quic.version,
+        "odcid_len": quic.original_destination_connection_id_len,
+        "scid_len": quic.source_connection_id_len,
+        "alpn": quic.alpn,
+        "transport_parameters": quic.transport_parameters,
+        "tls_stable": quic.tls.as_ref().and_then(|tls| tls.stable_tls_fp.clone()),
+    });
+
+    format!("zquic1_{}", short_hash(&value))
+}
+
+pub fn fingerprint_http3(quic: &QuicObservation) -> Option<String> {
+    if quic.http3_settings.is_empty() && !quic.alpn.iter().any(|value| value.starts_with("h3")) {
+        return None;
+    }
+
+    let value = json!({
+        "alpn": quic.alpn,
+        "settings": quic.http3_settings,
+    });
+    Some(format!("zh3_{}", short_hash(&value)))
+}
+
 pub fn fingerprint_browser(browser: &BrowserProbe) -> String {
-    // В основной browser fingerprint не включаем время сбора и performance timings.
-    // Они полезны как сигналы, но слишком изменчивы для стабильного идентификатора.
+    // В основной browser fingerprint не включаем время, батарею и performance timings.
+    // Эти сигналы полезны для анализа, но намеренно нестабильны между сессиями.
     let value = json!({
         "navigator": browser.navigator,
         "ua_ch": browser.user_agent_client_hints,

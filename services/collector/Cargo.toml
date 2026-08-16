@@ -1,6 +1,6 @@
 [package]
 name = "client-intel-collector"
-version = "0.1.0"
+version = "1.0.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -8,11 +8,18 @@ rust-version.workspace = true
 
 [dependencies]
 axum.workspace = true
+bytes.workspace = true
 chrono.workspace = true
 client-intel-core = { path = "../../crates/client-intel-core" }
 http.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+h3.workspace = true
+h3-axum.workspace = true
+h3-quinn.workspace = true
+libc.workspace = true
+quinn.workspace = true
+ipnet.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 serde.workspace = true

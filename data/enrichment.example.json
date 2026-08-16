@@ -1,0 +1,21 @@
+[
+  {
+    "cidr": "203.0.113.0/24",
+    "source": "example-only",
+    "country_code": "DE",
+    "country": "Germany",
+    "region": "Berlin",
+    "city": "Berlin",
+    "timezone": "Europe/Berlin",
+    "asn": 64500,
+    "organization": "Example Residential ISP",
+    "network_type": "residential",
+    "is_hosting": false,
+    "is_mobile": false,
+    "is_vpn": false,
+    "is_proxy": false,
+    "is_tor": false,
+    "tags": ["example", "documentation-range"],
+    "confidence": 0.95
+  }
+]

@@ -1,36 +1,138 @@
 # Zorin Client Intelligence
 
-Zorin Client Intelligence (ZCI) — первый фундамент client-intelligence / device-fingerprinting SaaS. Он объединяет наблюдаемые сетевые признаки с браузерными сигналами и хранит не один «магический visitor ID», а полный evidence profile.
+**Zorin Client Intelligence (ZCI)** — self-hosted client-intelligence и device-fingerprinting engine, который объединяет сетевые, TLS, HTTP, QUIC и browser-side сигналы в единый evidence profile.
 
-## Что уже есть
+ZCI не сводит клиента к одному «visitor hash». Каждый observation хранит происхождение данных и независимые component fingerprints, а historical client graph оценивает вероятность того, что новый observation относится к ранее наблюдавшемуся client entity.
 
-- Rust collector с HTTP и собственным HTTPS edge.
-- Byte-level разбор исходного TLS ClientHello до TLS-терминации.
-- JA3, JA4 и собственный стабильный `ZTLS` fingerprint.
-- HTTP fingerprint по версии протокола, набору заголовков и browser fetch characteristics.
-- Browser probe без внешних зависимостей.
-- UA / UA-CH high entropy values.
-- Screen / viewport / DPR / orientation.
-- Intl / timezone / locale formatting fingerprint.
-- Media queries и input/display capabilities.
-- WebGL / WebGPU capabilities.
-- Canvas и OfflineAudio fingerprints.
-- Font metric probe + отдельный Local Font Access API по явному разрешению.
-- Codec / MediaSource capabilities.
-- Storage, Permissions, Network Information, Battery и Performance signals.
-- Automation indicators.
-- Speech synthesis voices.
-- Component fingerprints вместо одного общего hash.
-- `observed / claimed / inferred` модель.
-- Consistency/anomaly engine.
-- Сравнение двух observations через `/api/v1/compare/:left/:right`.
-- PostgreSQL JSONB storage с in-memory fallback.
-- Self-inspection UI `/inspect`.
-- Docker Compose.
+## Возможности финального релиза 1.0
+
+### Network / transport
+
+- реальный peer IPv4/IPv6 и socket metadata;
+- trusted-proxy mode с allowlist CIDR;
+- offline CIDR enrichment: Geo/ASN/organization/network type/VPN/proxy/Tor flags;
+- Linux TCP runtime telemetry через `TCP_INFO`;
+- optional XDP/eBPF SYN sensor: TTL/Hop Limit, MSS, window, scale, SACK, timestamps, ECN, TCP option order;
+- `ZTCP` fingerprint.
+
+### TLS
+
+Collector смотрит исходные ClientHello bytes **до** rustls termination:
+
+- ClientHello через один или несколько TLS records;
+- record/legacy/supported TLS versions;
+- cipher suites и их порядок;
+- extension IDs и детали;
+- groups, EC point formats, signature algorithms;
+- certificate signature algorithms;
+- key shares;
+- ALPN и SNI;
+- PSK modes, session ticket, early data;
+- padding;
+- certificate compression;
+- GREASE;
+- ECH/ALPS indicators;
+- raw ClientHello SHA-256;
+- JA3;
+- JA4;
+- `ZTLS` — нормализованный fingerprint;
+- `ZTLS-WIRE` — order-sensitive fingerprint;
+- negotiated TLS version/ALPN.
+
+Случайные/секретные TLS values не сохраняются как fingerprint material.
+
+### HTTP/1.1 и HTTP/2
+
+После TLS termination используется wire-tap до Hyper parser:
+
+- H1 request line;
+- точный wire-order заголовков;
+- исходный header casing;
+- duplicate header observations;
+- `ZH1-WIRE`;
+- HTTP/2 client preface;
+- SETTINGS values и wire-order;
+- SETTINGS ACK;
+- initial WINDOW_UPDATE;
+- последовательность первых frames;
+- `ZH2`;
+- нормализованный application-level `ZHTTP`.
+
+Credential-bearing header values redacted до хранения.
+
+### Native QUIC / HTTP/3
+
+Отдельный listener на Quinn + h3:
+
+- UDP peer/local metadata;
+- address-validation state;
+- original destination connection ID length;
+- negotiated H3 ALPN;
+- runtime RTT;
+- max datagram size;
+- `ZQUIC`;
+- `ZH3` для доступного H3/runtime material;
+- `Alt-Svc` discovery с HTTPS endpoint.
+
+ZCI не выдумывает QUIC-поля, которых выбранный userspace QUIC API не предоставляет. TCP/TLS listener остаётся источником сырого TLS ClientHello/JA3/JA4.
+
+### Browser probe
+
+`web/probe.js` — dependency-free first-party SDK с режимами `essential`, `security`, `full`:
+
+- User-Agent + UA Client Hints/high-entropy values;
+- navigator/platform/languages/hardwareConcurrency/deviceMemory/touch;
+- screen, viewport, DPR, orientation;
+- Intl/timezone/formatting;
+- media queries/input/display/privacy preferences;
+- WebGL/WebGL2/WebGPU;
+- Canvas;
+- OfflineAudio;
+- font metric inference;
+- codecs/media capabilities;
+- storage/permissions;
+- Network Information API;
+- Battery API;
+- Performance API;
+- browser/platform capability matrix;
+- automation indicators;
+- speech voices;
+- component fingerprints `ZBROWSER`, `ZGPU`, `ZCANVAS`, `ZAUDIO`, `ZFONTS`, `ZINTL`, `ZCAP`, `ZSCREEN`, `ZMEDIA`, `ZAUTO`.
+
+Permission-gated/особенно чувствительные probes вынесены в отдельный explicit opt-in: geolocation, Local Font Access, media devices, keyboard layout, WebRTC candidate collection.
+
+### Correlation / client graph
+
+Каждый POST `/api/v1/observe` получает:
+
+- immutable `observation.id`;
+- tenant-scoped `client_id`;
+- resolution `new_client`, `matched_client` или `ambiguous`;
+- weighted similarity probability;
+- confidence по доступному evidence;
+- matching/conflicting component list;
+- consistency/anomaly profile;
+- automation/privacy/network risk scores.
+
+Смена IP или одной нестабильной browser/TLS части не обязана создавать нового client entity.
+
+### SaaS / operations
+
+- PostgreSQL JSONB + in-memory development mode;
+- tenant-scoped public site keys и secret admin keys;
+- CORS allowlist;
+- observation retention;
+- Prometheus text metrics;
+- self-inspection UI `/inspect`;
+- health/schema endpoints;
+- Docker Compose;
+- optional eBPF sidecar compose profile;
+- CI для Rust, JS и Linux sensor;
+- smoke test.
 
 ## Быстрый запуск
 
-### Вариант 1: только HTTP, без PostgreSQL
+### 1. Native HTTP-only
 
 ```bash
 cargo run -p client-intel-collector
@@ -42,19 +144,13 @@ cargo run -p client-intel-collector
 http://localhost:8080/inspect
 ```
 
-TLS/JA3/JA4 в этом режиме отсутствуют, потому что браузер не делает TLS handshake с collector.
+В этом режиме browser/HTTP/IP сигналы работают, но TLS и HTTP/3 отсутствуют.
 
-### Вариант 2: полноценный HTTPS collector
-
-Создать development certificate:
+### 2. HTTPS + HTTP/2 + HTTP/3
 
 ```bash
 ./scripts/dev-cert.sh
-```
 
-Запустить:
-
-```bash
 ZCI_TLS_CERT=certs/cert.pem \
 ZCI_TLS_KEY=certs/key.pem \
 cargo run -p client-intel-collector
@@ -66,76 +162,145 @@ cargo run -p client-intel-collector
 https://localhost:8443/inspect
 ```
 
-Для self-signed сертификата браузеру потребуется вручную подтвердить доверие.
+HTTPS listener использует TCP `:8443`, native HTTP/3 — UDP `:8443`. После первого HTTPS-ответа ZCI публикует `Alt-Svc` для H3 discovery.
 
-### Docker Compose
+### 3. Docker Compose
 
 ```bash
+cp .env.example .env
 ./scripts/dev-cert.sh
 docker compose up --build
 ```
 
-## API
+С Linux SYN sensor:
 
-### `GET /health`
-
-Состояние collector/storage.
-
-### `POST /api/v1/observe`
-
-Тело — объект `zci-browser-probe/1`, который создаёт `/probe.js`.
-
-Ответ — полная observation:
-
-```json
-{
-  "id": "...",
-  "connection": {
-    "remote_ip": "...",
-    "transport": "tcp+tls",
-    "tls": {
-      "ja3": "...",
-      "ja4": "...",
-      "stable_tls_fp": "ztls1_..."
-    }
-  },
-  "http": {},
-  "browser": {},
-  "fingerprints": {},
-  "profile": {}
-}
+```bash
+ZCI_SENSOR_INTERFACE=eth0 docker compose --profile sensor up --build
 ```
 
-### `GET /api/v1/observations/:id`
+XDP sidecar требует Linux, BTF и privileged access для attach.
 
-Возвращает сохранённую observation.
+### Smoke test
 
-### `GET /api/v1/compare/:left/:right`
+```bash
+./scripts/smoke.sh
+```
 
-Сравнивает component fingerprints двух observations и возвращает вероятностное сходство.
+Полная release-проверка на машине с Rust toolchain:
 
-## Принцип модели
+```bash
+./scripts/release-check.sh
+```
+
+Или для другого endpoint:
+
+```bash
+ZCI_BASE_URL=https://example.test ./scripts/smoke.sh
+```
+
+## Browser SDK
+
+Минимально:
+
+```html
+<script src="https://intel.example.com/probe.js"></script>
+<script>
+  const observation = await ZCI.observe({
+    endpoint: "https://intel.example.com/api/v1/observe",
+    siteKey: "PUBLIC_SITE_KEY",
+    mode: "security"
+  });
+
+  console.log(observation.client_id, observation.resolution);
+</script>
+```
+
+`siteKey` предназначен для first-party браузерной интеграции и не считается секретом. Чтение сохранённых observations защищается отдельным admin key.
+
+Explicit sensitive collection запускается только интегратором:
+
+```js
+const sensitive = await ZCI.collectSensitive({
+  geolocation: true,
+  localFonts: true,
+  mediaDevices: true,
+  keyboardLayout: true,
+  webRtcCandidates: true,
+});
+```
+
+Не включайте эти probes без подходящего UX/consent/legal basis.
+
+## API
+
+Основные endpoints:
+
+```text
+GET  /health
+GET  /metrics
+GET  /api/v1/schema
+GET  /probe.js
+GET  /inspect
+
+POST /api/v1/observe
+GET  /api/v1/observations/:id
+GET  /api/v1/compare/:left/:right
+GET  /api/v1/clients/:id
+```
+
+- `POST /api/v1/observe` использует `X-ZCI-Site-Key`, если настроены site keys.
+- read/compare/client endpoints используют `X-ZCI-Admin-Key`, если настроены admin keys.
+
+Подробнее: [`docs/API.md`](docs/API.md).
+
+## Data model
 
 ZCI принципиально различает:
 
-- **observed** — сервер увидел сам: IP, ClientHello, negotiated TLS, HTTP request;
-- **claimed** — клиент сообщил о себе: User-Agent, UA-CH, navigator/platform;
-- **inferred** — движок сделал вывод: probable OS/browser/device, automation probability, anomalies.
+- **observed** — сервер увидел сам;
+- **claimed** — клиент сообщил о себе;
+- **inferred** — движок сделал вероятностный вывод;
+- **enriched** — данные пришли из явно подключённой внешней/offline базы.
 
-Это позволяет не выдавать эвристику за факт и строить граф согласованности.
+Это не позволяет эвристике тихо превратиться в «факт».
 
-## Почему Cookie и Authorization не сохраняются
+## Privacy/security defaults
 
-ZCI сохраняет присутствие и имя HTTP-заголовка, но значения `Cookie`, `Set-Cookie`, `Authorization` и `Proxy-Authorization` заменяет на `<redacted>`. Секреты почти никогда не добавляют полезной fingerprint entropy, зато превращают телеметрию в хранилище учётных данных.
+По умолчанию ZCI:
 
-## Ограничения v0.1
+- не сохраняет значения `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, ZCI/API keys;
+- не сохраняет query values: остаются только path + имена/порядок параметров;
+- очищает browser `document.referrer` от credentials/query/fragment;
+- не доверяет `X-Forwarded-For`, пока trusted-proxy mode явно не включён;
+- не запускает permission-gated browser probes автоматически;
+- использует finite retention;
+- не называет fingerprint криптографическим доказательством личности.
 
-- HTTP header order берётся после разбора Hyper и не считается точным wire-order fingerprint. Для точного H1 order нужен raw HTTP tap перед parser.
-- TCP SYN fingerprint пока не реализован: обычный userspace TCP socket получает соединение уже после handshake. Для него нужен eBPF/AF_PACKET/pcap sidecar.
-- QUIC/HTTP3 отсутствуют; следующий edge должен использовать `quinn` и собственный QUIC transport-parameter fingerprint.
-- ASN/Geo/VPN/hosting enrichment не включён в ядро. Его следует подключать отдельными providers, чтобы не смешивать наблюдаемые данные и сторонние базы.
-- Risk scores сейчас намеренно консервативны: один fingerprint не объявляется доказательством бота, VPN или личности.
+См. [`SECURITY.md`](SECURITY.md) и [`docs/PRIVACY.md`](docs/PRIVACY.md).
 
-## Следующие технические слои
+## Структура
 
-См. `docs/ARCHITECTURE.md` и `docs/SIGNAL_CATALOG.md`.
+```text
+crates/client-intel-core/     parser, fingerprints, models, correlation
+services/collector/           HTTP/TLS/QUIC edge + API + storage
+sensors/linux-tcp/            optional XDP/eBPF SYN sensor
+web/probe.js                  browser SDK
+web/inspect.html              self-inspection console
+migrations/                   PostgreSQL schema
+data/                         offline enrichment example
+docs/                         architecture/API/deployment/privacy/catalog
+scripts/                      development/smoke helpers
+```
+
+
+## Документация
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- [`docs/SIGNAL_CATALOG.md`](docs/SIGNAL_CATALOG.md)
+- [`docs/API.md`](docs/API.md)
+- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md)
+- [`docs/PRIVACY.md`](docs/PRIVACY.md)
+
+## License
+
+Copyright © 2026 Ivan Zorin. All rights reserved. См. [`LICENSE`](LICENSE).

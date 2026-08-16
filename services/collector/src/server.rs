@@ -1,7 +1,10 @@
 use crate::config::Config;
+use crate::wire::{TapIo, WireState};
 use axum::extract::Extension;
 use axum::Router;
-use client_intel_core::{describe_ip, parse_client_hello, ConnectionMeta};
+use client_intel_core::{
+    describe_ip, parse_client_hello, ClientHelloParseError, ConnectionMeta, TcpObservation,
+};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::service::TowerToHyperService;
@@ -15,6 +18,26 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info};
 
+#[derive(Clone)]
+pub struct ConnectionContext {
+    base: ConnectionMeta,
+    wire: WireState,
+}
+
+impl ConnectionContext {
+    pub fn new(base: ConnectionMeta, wire: WireState) -> Self {
+        Self { base, wire }
+    }
+
+    pub fn snapshot(&self) -> ConnectionMeta {
+        let mut result = self.base.clone();
+        let wire = self.wire.snapshot();
+        result.http1_wire = wire.http1;
+        result.http2 = wire.http2;
+        result
+    }
+}
+
 pub async fn run_http_server(
     config: Arc<Config>,
     router: Router,
@@ -26,19 +49,24 @@ pub async fn run_http_server(
         let (stream, remote_addr) = listener.accept().await?;
         let router = router.clone();
         let local_addr = stream.local_addr().ok();
+        let tcp = tcp_runtime_observation(&stream);
 
         tokio::spawn(async move {
+            let wire = WireState::default();
             let meta = ConnectionMeta {
                 remote_ip: Some(remote_addr.ip().to_string()),
                 ip: Some(describe_ip(remote_addr.ip())),
                 remote_port: Some(remote_addr.port()),
+                local_ip: local_addr.map(|value| value.ip().to_string()),
                 local_port: local_addr.map(|value| value.port()),
                 transport: "tcp".to_string(),
-                tls: None,
+                tcp,
+                ..ConnectionMeta::default()
             };
+            let context = ConnectionContext::new(meta, wire.clone());
 
-            if let Err(error) = serve_plain(stream, router, meta).await {
-                debug!(?error, "plain HTTP connection ended with error");
+            if let Err(error) = serve_plain(TapIo::new(stream, wire), router, context).await {
+                debug!(?error, "HTTP connection ended with error");
             }
         });
     }
@@ -58,6 +86,7 @@ pub async fn run_tls_server(
         let acceptor = acceptor.clone();
         let router = router.clone();
         let local_addr = stream.local_addr().ok();
+        let tcp = tcp_runtime_observation(&stream);
 
         tokio::spawn(async move {
             let tls_observation = peek_client_hello(&stream).await;
@@ -82,16 +111,21 @@ pub async fn run_tls_server(
             tls_observation.negotiated_alpn = negotiated_alpn;
             tls_observation.negotiated_tls_version = negotiated_tls_version;
 
+            let wire = WireState::default();
             let meta = ConnectionMeta {
                 remote_ip: Some(remote_addr.ip().to_string()),
                 ip: Some(describe_ip(remote_addr.ip())),
                 remote_port: Some(remote_addr.port()),
+                local_ip: local_addr.map(|value| value.ip().to_string()),
                 local_port: local_addr.map(|value| value.port()),
                 transport: "tcp+tls".to_string(),
+                tcp,
                 tls: Some(tls_observation),
+                ..ConnectionMeta::default()
             };
+            let context = ConnectionContext::new(meta, wire.clone());
 
-            if let Err(error) = serve_tls(tls_stream, router, meta).await {
+            if let Err(error) = serve_tls(TapIo::new(tls_stream, wire), router, context).await {
                 debug!(?error, "HTTPS connection ended with error");
             }
         });
@@ -99,8 +133,8 @@ pub async fn run_tls_server(
 }
 
 async fn peek_client_hello(stream: &TcpStream) -> Option<client_intel_core::TlsObservation> {
-    let result = tokio::time::timeout(Duration::from_millis(500), async {
-        let mut buffer = vec![0_u8; 65_535];
+    let result = tokio::time::timeout(Duration::from_secs(1), async {
+        let mut buffer = vec![0_u8; 256 * 1024];
 
         loop {
             let read = match stream.peek(&mut buffer).await {
@@ -112,27 +146,16 @@ async fn peek_client_hello(stream: &TcpStream) -> Option<client_intel_core::TlsO
                 }
             };
 
-            // Первые 5 байт TLS record дают точную длину первой записи.
-            // Ждём её целиком, чтобы TCP segmentation не превращала ClientHello в ложный parse error.
-            if read < 5 {
-                tokio::time::sleep(Duration::from_millis(2)).await;
-                continue;
-            }
-
-            let record_len = u16::from_be_bytes([buffer[3], buffer[4]]) as usize;
-            let needed = 5usize.saturating_add(record_len);
-            if read < needed && read < buffer.len() {
-                tokio::time::sleep(Duration::from_millis(2)).await;
-                continue;
-            }
-
-            return match parse_client_hello(&buffer[..read]) {
-                Ok(value) => Some(value),
+            match parse_client_hello(&buffer[..read]) {
+                Ok(value) => return Some(value),
+                Err(ClientHelloParseError::Incomplete) if read < buffer.len() => {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
                 Err(error) => {
                     debug!(?error, bytes = read, "unable to parse ClientHello");
-                    None
+                    return None;
                 }
-            };
+            }
         }
     })
     .await;
@@ -146,30 +169,31 @@ async fn peek_client_hello(stream: &TcpStream) -> Option<client_intel_core::TlsO
     }
 }
 
-async fn serve_plain(
-    stream: TcpStream,
+async fn serve_plain<T>(
+    stream: T,
     router: Router,
-    meta: ConnectionMeta,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    context: ConnectionContext,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let io = TokioIo::new(stream);
-    let service = router.layer(Extension(meta));
+    let service = router.layer(Extension(context));
     let service = TowerToHyperService::new(service);
     let builder = Builder::new(TokioExecutor::new());
     builder.serve_connection(io, service).await?;
     Ok(())
 }
 
-async fn serve_tls(
-    stream: tokio_rustls::server::TlsStream<TcpStream>,
+async fn serve_tls<T>(
+    stream: T,
     router: Router,
-    meta: ConnectionMeta,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let io = TokioIo::new(stream);
-    let service = router.layer(Extension(meta));
-    let service = TowerToHyperService::new(service);
-    let builder = Builder::new(TokioExecutor::new());
-    builder.serve_connection(io, service).await?;
-    Ok(())
+    context: ConnectionContext,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    serve_plain(stream, router, context).await
 }
 
 fn load_tls_config(config: &Config) -> Result<ServerConfig, Box<dyn std::error::Error + Send + Sync>> {
@@ -198,4 +222,42 @@ fn load_tls_config(config: &Config) -> Result<ServerConfig, Box<dyn std::error::
     tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(tls_config)
+}
+
+#[cfg(target_os = "linux")]
+fn tcp_runtime_observation(stream: &TcpStream) -> Option<TcpObservation> {
+    use std::mem::{size_of, zeroed};
+    use std::os::fd::AsRawFd;
+
+    unsafe {
+        let mut info: libc::tcp_info = zeroed();
+        let mut len = size_of::<libc::tcp_info>() as libc::socklen_t;
+        let rc = libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            &mut info as *mut _ as *mut libc::c_void,
+            &mut len,
+        );
+        if rc != 0 {
+            return None;
+        }
+
+        Some(TcpObservation {
+            source: "linux-tcp-info".to_string(),
+            runtime_rtt_us: Some(info.tcpi_rtt),
+            runtime_rtt_var_us: Some(info.tcpi_rttvar),
+            runtime_snd_mss: Some(info.tcpi_snd_mss),
+            runtime_rcv_mss: Some(info.tcpi_rcv_mss),
+            runtime_snd_cwnd: Some(info.tcpi_snd_cwnd),
+            runtime_retransmits: Some(info.tcpi_retransmits as u32),
+            runtime_total_retrans: Some(info.tcpi_total_retrans),
+            ..TcpObservation::default()
+        })
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tcp_runtime_observation(_stream: &TcpStream) -> Option<TcpObservation> {
+    None
 }

@@ -1,64 +1,218 @@
-# Architecture
+# ZCI Architecture 1.0
 
-## 1. Цель
+## 1. Design goal
 
-ZCI должен отвечать не на вопрос «какой один hash у клиента?», а на четыре разных вопроса:
+ZCI отвечает не на вопрос «какой hash у клиента?», а на четыре независимых вопроса:
 
-1. Что мы **наблюдали** на сети и HTTP?
-2. Что клиент **заявил** о себе?
-3. Что мы можем **вывести** из этих признаков?
-4. Насколько признаки **согласованы** между собой и с предыдущими observations?
+1. Что сервер **наблюдал** на транспортном/TLS/HTTP уровне?
+2. Что клиент **заявил** через HTTP/browser APIs?
+3. Что движок может **вывести** из комбинации сигналов?
+4. Насколько новый observation **похож на исторические observations** того же tenant?
 
-## 2. Data flow
+Каждый вывод хранится отдельно от первичного evidence.
+
+## 2. End-to-end flow
 
 ```text
-Client
-  │
-  ├── TCP socket
-  │     └── future: eBPF SYN observer -> ZTCP
-  │
-  ├── TLS ClientHello
-  │     └── raw peek parser -> JA3 / JA4 / ZTLS
-  │
-  ├── HTTP/1.1 or HTTP/2
-  │     └── request metadata -> ZHTTP
-  │
-  └── browser probe.js
-        ├── UA / UA-CH
-        ├── rendering
-        ├── graphics
-        ├── media
-        ├── locale
-        ├── storage / permissions
-        ├── capabilities
-        └── behavioral/environment signals
-              │
-              ▼
-        Normalization
-              │
-              ▼
-        Component fingerprints
-              │
-              ▼
-        Consistency engine
-              │
-              ▼
-        Observation document
-              │
-        ┌─────┴─────┐
-        ▼           ▼
-    PostgreSQL    API/UI
+                           ┌───────────────────────┐
+                           │      Browser SDK      │
+                           │  navigator/render/etc │
+                           └───────────┬───────────┘
+                                       │ POST probe
+                                       ▼
+Client ── TCP SYN ──► optional XDP sensor ─────┐
+  │                                             │ tuple cache
+  ├─ TCP socket ──► TCP_INFO ──────────────────┤
+  │                                             │
+  ├─ TLS records ─► raw ClientHello parser ────┤
+  │                                             │
+  ├─ decrypted H1/H2 ─► wire tap ──────────────┤
+  │                                             │
+  └─ QUIC/H3 ─────► native Quinn/h3 listener ──┤
+                                                ▼
+                                      ConnectionContext
+                                                │
+                              ┌─────────────────┼─────────────────┐
+                              ▼                 ▼                 ▼
+                         enrichment        normalization      redaction
+                              │                 │                 │
+                              └─────────────────┴─────────────────┘
+                                                ▼
+                                      component fingerprints
+                                                │
+                                                ▼
+                                       consistency engine
+                                                │
+                                                ▼
+                                       historical matcher
+                                                │
+                                    ┌───────────┴───────────┐
+                                    ▼                       ▼
+                              Observation              Client entity
+                                    │                       │
+                                    └───────────┬───────────┘
+                                                ▼
+                                        PostgreSQL / API
 ```
 
-## 3. Почему несколько fingerprints
+## 3. Components
 
-Полный hash ломается после любого обновления. Поэтому ZCI хранит независимые компоненты:
+### `client-intel-core`
+
+Pure/domain layer:
+
+- serializable models;
+- TLS ClientHello parser;
+- JA3/JA4;
+- ZCI component fingerprints;
+- consistency/profile engine;
+- observation similarity calculation;
+- IP metadata helpers.
+
+Core не зависит от Axum/PostgreSQL/Quinn.
+
+### `client-intel-collector`
+
+Runtime/edge layer:
+
+- HTTP development listener;
+- TCP/TLS edge;
+- decrypted wire tap;
+- native QUIC/H3 edge;
+- browser ingestion API;
+- tenant/auth boundary;
+- storage/client graph;
+- enrichment loader;
+- metrics/retention;
+- transport-sensor correlation.
+
+### `linux-tcp sensor`
+
+Опциональный Linux-only XDP observer. Userspace TCP socket уже не имеет доступа к исходному SYN packet, поэтому SYN fingerprint material собирается до TCP stack и join-ится по tuple.
+
+### `probe.js`
+
+First-party browser collector без внешних runtime dependencies. SDK ничего не отправляет сам по себе: интегратор вызывает `ZCI.collect()` или `ZCI.observe()`.
+
+## 4. TLS path
+
+TCP/TLS listener делает `TcpStream::peek()` до rustls handshake.
+
+Parser:
+
+1. читает один или несколько TLS records;
+2. собирает handshake stream;
+3. находит ClientHello;
+4. извлекает структурные поля;
+5. считает raw ClientHello SHA-256;
+6. строит JA3/JA4/ZTLS/ZTLS-WIRE;
+7. не потребляет bytes из socket;
+8. отдаёт тот же stream rustls.
+
+После handshake negotiated TLS metadata объединяется с pre-handshake observation.
+
+### `ZTLS`
+
+Нормализованный fingerprint. Volatile/GREASE элементы исключаются или нормализуются, списки, где порядок не должен определять identity, сортируются.
+
+### `ZTLS-WIRE`
+
+Order-sensitive fingerprint. Сохраняет wire shape ClientHello и полезен для определения конкретной реализации/маскировки.
+
+Использовать их следует вместе: `ZTLS` устойчивее, `ZTLS-WIRE` дискриминирует точнее.
+
+## 5. HTTP wire path
+
+Hyper должен получить уже разобранный transport stream, но ZCI нужен wire shape. Поэтому `TapIo` стоит **между TLS/plain stream и Hyper** и копирует только bounded prefix.
+
+### HTTP/1
+
+Из tap извлекаются:
+
+- request line;
+- exact header sequence;
+- original casing;
+- duplicate entries;
+- wire header fingerprint.
+
+Body не нужен для wire fingerprint.
+
+### HTTP/2
+
+Tap распознаёт connection preface и разбирает bounded sequence frames:
+
+- SETTINGS IDs/values/order;
+- SETTINGS ACK;
+- WINDOW_UPDATE;
+- первые frame type/flags/stream/length tuples.
+
+HPACK payload не сохраняется.
+
+## 6. QUIC / HTTP/3 path
+
+QUIC использует отдельный UDP listener на Quinn.
+
+До handshake сохраняются metadata `Incoming`, после handshake — runtime metadata `Connection`, negotiated ALPN и H3 request handling через `h3`/`h3-axum`.
+
+QUIC observation намеренно содержит только то, что runtime реально раскрывает. Он не подменяет TCP/TLS ClientHello parser и не утверждает, что видел raw CRYPTO frames, если их не видел.
+
+`Alt-Svc` на HTTPS UI/SDK responses позволяет браузеру обнаружить H3 endpoint.
+
+## 7. TCP sensor correlation
 
 ```text
-JA3
-JA4
-ZTLS
+SYN packet
+   │
+   ▼
+XDP parser
+   │
+   ├─ remote IP
+   ├─ remote port
+   ├─ local port
+   └─ TCP traits
+          │
+          ▼
+Unix datagram
+          │
+          ▼
+30s tuple cache
+          │
+          └── join ─► accepted application connection
+```
+
+Runtime `TCP_INFO` поля сохраняются при merge с sensor event.
+
+## 8. Evidence model
+
+### Observed
+
+Источник: socket/TLS/HTTP/QUIC/browser request transport.
+
+### Claimed
+
+Источник: User-Agent, UA-CH, navigator и другие значения, сообщённые client runtime.
+
+### Inferred
+
+Источник: правила/эвристики consistency engine.
+
+Каждый inference содержит confidence и evidence refs.
+
+### Enriched
+
+Источник: явно подключённая offline CIDR database. Enrichment никогда не маскируется под observed fact.
+
+## 9. Fingerprint strategy
+
+ZCI хранит независимые components:
+
+```text
+JA3 / JA4
+ZTLS / ZTLS-WIRE
+ZTCP
 ZHTTP
+ZH1-WIRE / ZH2
+ZQUIC / ZH3
 ZBROWSER
 ZGPU
 ZCANVAS
@@ -66,142 +220,72 @@ ZAUDIO
 ZFONTS
 ZINTL
 ZCAP
+ZSCREEN
+ZMEDIA
+ZAUTO
 ```
 
-При сравнении observations компоненты получают разные веса. Смена сети или minor browser update не должна автоматически означать новое устройство.
+Нельзя использовать один component как identity proof. Исторический matcher учитывает доступность каждого component и разные веса.
 
-## 4. TLS edge
+## 10. Client graph
 
-`services/collector/src/server.rs` делает `TcpStream::peek()` до rustls handshake. Peek не потребляет данные, поэтому:
+При новом observation:
 
-1. ZCI видит оригинальные bytes ClientHello.
-2. Собственный parser извлекает fingerprint material.
-3. Тот же сокет передаётся rustls.
-4. После handshake Hyper обслуживает HTTP/1.1 или HTTP/2.
+1. выбираются recent candidate observations того же tenant за `graph_window_days`;
+2. рассчитывается component-level similarity;
+3. строятся probability + confidence;
+4. лучший candidate сравнивается с configurable threshold;
+5. близкий второй candidate с другим `client_id` переводит результат в `ambiguous`;
+6. иначе создаётся новый или используется существующий `client_id`.
 
-Так исходный ClientHello не теряется за reverse proxy.
+Это intentionally probabilistic linkage, не криптографическая идентичность.
 
-### ClientHello parser
+## 11. Storage
 
-Текущая версия извлекает:
+### PostgreSQL
 
-- TLS record version;
-- legacy ClientHello version;
-- supported_versions;
-- cipher suites;
-- extension IDs;
-- supported groups;
-- EC point formats;
-- signature algorithms;
-- key_share groups;
-- ALPN;
-- SNI;
-- session ID length;
-- compression methods;
-- record / ClientHello lengths.
+`observations` хранит:
 
-GREASE исключается из JA3/JA4 material.
+- индексируемые top-level fields;
+- полную immutable JSONB document representation.
 
-## 5. HTTP layer
+`clients` хранит materialized summary:
 
-Текущий ZHTTP содержит:
+- first/last seen;
+- observation count;
+- latest profile/fingerprints.
 
-- HTTP version;
-- header names;
-- Accept;
-- Accept-Encoding;
-- Accept-Language;
-- Sec-Fetch-*;
-- Sec-CH-UA-*;
-- Priority.
+Migrations idempotent и выполняются collector при старте. Docker image PostgreSQL также может применить их на пустом volume.
 
-В будущем raw H1 observer должен дополнительно сохранить:
+### In-memory
 
-- точный wire order;
-- исходный casing;
-- whitespace style;
-- duplicate header behavior;
-- malformed/edge-case behavior.
+Без `DATABASE_URL` collector работает в memory mode. Он поддерживает тот же API/client graph, но всё теряется после restart.
 
-HTTP/2 observer должен добавить:
+## 12. Tenancy
 
-- SETTINGS values/order;
-- pseudo-header order;
-- initial window behavior;
-- PRIORITY / PRIORITY_UPDATE;
-- frame sequencing;
-- HPACK dynamic-table behavior.
-
-## 6. TCP layer
-
-Userspace listener не видит исходный SYN после `accept()`. Поэтому production ZTCP проектируется как отдельный Linux observer:
+Site/admin keys задаются через env mapping:
 
 ```text
-XDP/eBPF or AF_PACKET
-        │
-        ├── src/dst tuple
-        ├── TTL
-        ├── MSS
-        ├── window
-        ├── window scale
-        ├── SACK
-        ├── timestamps
-        ├── ECN
-        └── option order
-              │
-              ▼
-        short-lived tuple cache
-              │
-              ▼
-        collector joins by 5-tuple
+tenant-a:key-a;tenant-b:key-b
 ```
 
-Это позволит сопоставлять TCP stack с TLS/HTTP легендой клиента.
+- site key → ingestion tenant;
+- admin key → read scope tenant;
+- tenant `*` у admin key даёт global read scope;
+- отсутствие настроенных keys сохраняет local-development behavior.
 
-## 7. QUIC / HTTP3
+## 13. Privacy boundary
 
-Следующий transport edge:
+Collector удаляет credential values до persistence. Browser sensitive APIs отделены explicit method. Historical `client_id` означает связь observations в рамках tenant и не должен называться реальной личностью.
 
-- QUIC version;
-- Initial packet size/pattern;
-- Connection ID lengths;
-- TLS ClientHello inside QUIC CRYPTO frames;
-- QUIC transport parameters;
-- parameter ordering;
-- HTTP/3 SETTINGS;
-- QPACK behavior.
+## 14. Scaling boundary
 
-Форматы: `ZQUIC` и `ZH3`.
+Текущий 1.0 collector — самодостаточный deployable unit. Для очень большого трафика его state boundaries уже позволяют разнести без изменения data model:
 
-## 8. Storage model
+- stateless edge collectors;
+- external sensor tuple cache;
+- PostgreSQL control/client state;
+- columnar observation/event warehouse;
+- standalone enrichment service.
 
-PostgreSQL используется как простой source of truth на раннем этапе. Observation хранится как полноценный JSONB document плюс отдельные индексируемые поля.
-
-Для high-volume SaaS логично разделить:
-
-- PostgreSQL — tenants, API keys, policies, client entities;
-- ClickHouse — immutable observations/event telemetry;
-- Redis — short-lived tuple/session correlation;
-- object storage — опциональные raw packet captures в debug/research режиме.
-
-## 9. Privacy boundary
-
-SDK не запускает collection автоматически. `collect()` должен вызываться интегратором осознанно. Permission-gated API (например Local Font Access) вынесены в отдельные методы и не вызываются тихо.
-
-По умолчанию collector также не сохраняет значения credential-bearing headers.
-
-## 10. Production decomposition
-
-```text
-zci-edge-tcp      eBPF/TCP observer
-zci-edge-tls      TLS/H1/H2 collector
-zci-edge-quic     QUIC/H3 collector
-zci-browser-sdk   first-party JS SDK
-zci-correlator    observation/session joining
-zci-identity      probabilistic client graph
-zci-enrichment    ASN/Geo/VPN/provider adapters
-zci-api           tenant-facing API
-zci-console       dashboard / inspector
-```
-
-Сейчас они намеренно собраны компактнее, чтобы core-модель можно было быстро гонять локально.
+Такое разбиение является deployment optimization, а не требованием для корректности 1.0.

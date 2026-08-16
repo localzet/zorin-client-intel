@@ -4,7 +4,7 @@ services:
     environment:
       POSTGRES_DB: zci
       POSTGRES_USER: zci
-      POSTGRES_PASSWORD: zci
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-zci}
     volumes:
       - zci-postgres:/var/lib/postgresql/data
       - ./migrations:/docker-entrypoint-initdb.d:ro
@@ -13,6 +13,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    restart: unless-stopped
 
   collector:
     build: .
@@ -22,16 +23,48 @@ services:
     environment:
       ZCI_BIND: 0.0.0.0:8443
       ZCI_HTTP_BIND: 0.0.0.0:8080
+      ZCI_QUIC_BIND: 0.0.0.0:8443
       ZCI_TLS_CERT: /certs/cert.pem
       ZCI_TLS_KEY: /certs/key.pem
-      DATABASE_URL: postgres://zci:zci@postgres:5432/zci
-      RUST_LOG: client_intel_collector=debug,tower_http=info
-      TRUST_PROXY_HEADERS: "false"
+      DATABASE_URL: postgres://zci:${POSTGRES_PASSWORD:-zci}@postgres:5432/zci
+      RETENTION_DAYS: ${RETENTION_DAYS:-30}
+      ZCI_SITE_KEYS: ${ZCI_SITE_KEYS:-}
+      ZCI_ADMIN_KEYS: ${ZCI_ADMIN_KEYS:-}
+      ZCI_CORS_ORIGINS: ${ZCI_CORS_ORIGINS:-}
+      ZCI_GRAPH_WINDOW_DAYS: ${ZCI_GRAPH_WINDOW_DAYS:-90}
+      ZCI_GRAPH_CANDIDATE_LIMIT: ${ZCI_GRAPH_CANDIDATE_LIMIT:-1500}
+      ZCI_GRAPH_MATCH_THRESHOLD: ${ZCI_GRAPH_MATCH_THRESHOLD:-0.76}
+      ZCI_GRAPH_MIN_CONFIDENCE: ${ZCI_GRAPH_MIN_CONFIDENCE:-0.42}
+      TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-false}
+      ZCI_TRUSTED_PROXY_CIDRS: ${ZCI_TRUSTED_PROXY_CIDRS:-127.0.0.0/8,::1/128}
+      ZCI_ENRICHMENT_DB: ${ZCI_ENRICHMENT_DB:-}
+      ZCI_SENSOR_SOCKET: /run/zci/tcp-sensor.sock
+      RUST_LOG: ${RUST_LOG:-client_intel_collector=info,tower_http=info}
     volumes:
       - ./certs:/certs:ro
+      - ./data:/data:ro
+      - zci-runtime:/run/zci
     ports:
-      - "8080:8080"
-      - "8443:8443"
+      - "8080:8080/tcp"
+      - "8443:8443/tcp"
+      - "8443:8443/udp"
+    restart: unless-stopped
+
+  tcp-sensor:
+    profiles: ["sensor"]
+    build:
+      context: ./sensors/linux-tcp
+    privileged: true
+    network_mode: host
+    environment:
+      ZCI_SENSOR_INTERFACE: ${ZCI_SENSOR_INTERFACE:-eth0}
+      ZCI_SENSOR_SOCKET: /run/zci/tcp-sensor.sock
+    volumes:
+      - /sys/kernel/btf:/sys/kernel/btf:ro
+      - /sys/fs/bpf:/sys/fs/bpf
+      - zci-runtime:/run/zci
+    restart: unless-stopped
 
 volumes:
   zci-postgres:
+  zci-runtime:

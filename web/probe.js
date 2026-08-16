@@ -735,10 +735,24 @@
         };
     }
 
+    function sanitizeReferrer(value) {
+        if (!value) {
+            return "";
+        }
+        return safe("referrer", () => {
+            const url = new URL(value);
+            url.username = "";
+            url.password = "";
+            url.search = "";
+            url.hash = "";
+            return url.toString();
+        }, "");
+    }
+
     function collectMisc() {
         return {
             history_length: history.length,
-            referrer: document.referrer,
+            referrer: sanitizeReferrer(document.referrer),
             visibility_state: document.visibilityState,
             document_character_set: document.characterSet,
             compat_mode: document.compatMode,
@@ -754,7 +768,169 @@
         };
     }
 
-    async function collect() {
+    async function collectSensitive(options = {}) {
+        const result = {
+            explicit: true,
+            collected_at: new Date().toISOString(),
+        };
+
+        if (options.geolocation) {
+            result.geolocation = await safeAsync("geolocation", () => new Promise((resolve, reject) => {
+                if (!navigator.geolocation) {
+                    resolve({ supported: false });
+                    return;
+                }
+                navigator.geolocation.getCurrentPosition(
+                    (position) => resolve({
+                        supported: true,
+                        latitude: position.coords.latitude,
+                        longitude: position.coords.longitude,
+                        accuracy_m: position.coords.accuracy,
+                        altitude_m: position.coords.altitude,
+                        altitude_accuracy_m: position.coords.altitudeAccuracy,
+                        heading: position.coords.heading,
+                        speed_mps: position.coords.speed,
+                        timestamp: position.timestamp,
+                    }),
+                    reject,
+                    {
+                        enableHighAccuracy: Boolean(options.highAccuracy),
+                        timeout: 8000,
+                        maximumAge: 0,
+                    },
+                );
+            }), { supported: false });
+        }
+
+        if (options.localFonts) {
+            result.local_fonts = await safeAsync("local-font-access", collectLocalFonts, { supported: false });
+        }
+
+        if (options.mediaDevices) {
+            result.media_devices = await safeAsync("media-devices", async () => {
+                if (!navigator.mediaDevices?.enumerateDevices) {
+                    return { supported: false };
+                }
+                const devices = await navigator.mediaDevices.enumerateDevices();
+                return {
+                    supported: true,
+                    devices: await Promise.all(devices.map(async (device) => ({
+                        kind: device.kind,
+                        label: device.label || null,
+                        device_id_hash: device.deviceId ? await sha256(device.deviceId) : null,
+                        group_id_hash: device.groupId ? await sha256(device.groupId) : null,
+                    }))),
+                };
+            }, { supported: false });
+        }
+
+        if (options.keyboardLayout) {
+            result.keyboard_layout = await safeAsync("keyboard-layout", async () => {
+                if (!navigator.keyboard?.getLayoutMap) {
+                    return { supported: false };
+                }
+                const map = await navigator.keyboard.getLayoutMap();
+                return {
+                    supported: true,
+                    entries: Array.from(map.entries()),
+                };
+            }, { supported: false });
+        }
+
+        if (options.webRtcCandidates) {
+            result.web_rtc_candidates = await safeAsync("webrtc-candidates", async () => {
+                if (typeof RTCPeerConnection === "undefined") {
+                    return { supported: false };
+                }
+                const connection = new RTCPeerConnection({ iceServers: [] });
+                const candidates = [];
+                connection.createDataChannel("zci");
+                connection.addEventListener("icecandidate", (event) => {
+                    if (event.candidate?.candidate && candidates.length < 16) {
+                        candidates.push(event.candidate.candidate);
+                    }
+                });
+                const offer = await connection.createOffer();
+                await connection.setLocalDescription(offer);
+                await new Promise((resolve) => setTimeout(resolve, 750));
+                connection.close();
+                return { supported: true, candidates };
+            }, { supported: false });
+        }
+
+        return result;
+    }
+
+    async function observe(options = {}) {
+        const endpoint = options.endpoint || "/api/v1/observe";
+        const probe = options.probe || await collect({ mode: options.mode || "full" });
+        if (options.sensitive) {
+            probe.sensitive = await collectSensitive(options.sensitive);
+        }
+
+        const headers = {
+            "content-type": "application/json",
+        };
+        if (options.siteKey) {
+            headers["x-zci-site-key"] = options.siteKey;
+        }
+
+        const response = await fetch(endpoint, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(probe),
+            credentials: "omit",
+            cache: "no-store",
+            redirect: "error",
+        });
+        if (!response.ok) {
+            throw new Error(`ZCI observe failed: HTTP ${response.status}`);
+        }
+        return await response.json();
+    }
+
+    function applyCollectionMode(probe, mode) {
+        if (mode === "full") {
+            return probe;
+        }
+
+        if (mode === "security") {
+            return {
+                ...probe,
+                battery: { omitted_by_mode: true },
+                voices: { omitted_by_mode: true },
+                performance: {
+                    navigation: probe.performance?.navigation ?? null,
+                    omitted_high_variance_fields: true,
+                },
+            };
+        }
+
+        if (mode === "essential") {
+            return {
+                ...probe,
+                viewport: { omitted_by_mode: true },
+                media_queries: { omitted_by_mode: true },
+                webgl: { omitted_by_mode: true },
+                webgpu: { omitted_by_mode: true },
+                canvas: { omitted_by_mode: true },
+                audio: { omitted_by_mode: true },
+                fonts: { omitted_by_mode: true },
+                media: { omitted_by_mode: true },
+                storage: { omitted_by_mode: true },
+                permissions: { omitted_by_mode: true },
+                battery: { omitted_by_mode: true },
+                performance: { omitted_by_mode: true },
+                voices: { omitted_by_mode: true },
+                automation: { webdriver: navigator.webdriver },
+            };
+        }
+
+        throw new Error(`Unknown ZCI collection mode: ${mode}`);
+    }
+
+    async function collect(options = {}) {
+        const mode = options.mode || "full";
         const [uaCh, webgpu, canvas, audio, storage, permissions, battery, voices] = await Promise.all([
             collectUaClientHints(),
             safeAsync("webgpu", collectWebGpu, { supported: false }),
@@ -766,8 +942,9 @@
             safeAsync("voices", collectVoices, { supported: false }),
         ]);
 
-        return {
-            schema: "zci-browser-probe/1",
+        const probe = {
+            schema: "zci-browser-probe/2",
+            collection_mode: mode,
             collected_at: new Date().toISOString(),
             navigator: collectNavigator(),
             user_agent_client_hints: uaCh,
@@ -790,11 +967,16 @@
             automation: collectAutomation(),
             voices,
             misc: collectMisc(),
+            sensitive: {},
         };
+
+        return applyCollectionMode(probe, mode);
     }
 
     window.ZCI = Object.freeze({
         collect,
+        collectSensitive,
         collectLocalFonts,
+        observe,
     });
 })();

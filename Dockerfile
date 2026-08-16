@@ -8,5 +8,5 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /src/target/release/client-intel-collector /usr/local/bin/client-intel-collector
-EXPOSE 8080 8443
+EXPOSE 8080/tcp 8443/tcp 8443/udp
 ENTRYPOINT ["/usr/local/bin/client-intel-collector"]

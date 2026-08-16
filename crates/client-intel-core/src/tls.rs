@@ -1,10 +1,10 @@
-use crate::fingerprint::fingerprint_tls_stable;
-use crate::TlsObservation;
+use crate::fingerprint::{fingerprint_tls_stable, fingerprint_tls_wire, sha256_hex};
+use crate::{TlsExtensionObservation, TlsObservation};
 use md5::{Digest, Md5};
 use sha2::Sha256;
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum ClientHelloParseError {
     #[error("TLS record is incomplete")]
     Incomplete,
@@ -111,7 +111,7 @@ fn parse_alpn(data: &[u8]) -> Vec<String> {
     result
 }
 
-fn parse_supported_groups(data: &[u8]) -> Vec<u16> {
+fn parse_u16_prefixed(data: &[u8]) -> Vec<u16> {
     let mut cursor = Cursor::new(data);
     let Ok(len) = cursor.u16() else {
         return Vec::new();
@@ -122,11 +122,7 @@ fn parse_supported_groups(data: &[u8]) -> Vec<u16> {
     parse_u16_vector(values)
 }
 
-fn parse_signature_algorithms(data: &[u8]) -> Vec<u16> {
-    parse_supported_groups(data)
-}
-
-fn parse_supported_versions(data: &[u8]) -> Vec<u16> {
+fn parse_u8_prefixed_u16(data: &[u8]) -> Vec<u16> {
     let mut cursor = Cursor::new(data);
     let Ok(len) = cursor.u8() else {
         return Vec::new();
@@ -135,6 +131,18 @@ fn parse_supported_versions(data: &[u8]) -> Vec<u16> {
         return Vec::new();
     };
     parse_u16_vector(values)
+}
+
+fn parse_u8_vector(data: &[u8]) -> Vec<u8> {
+    let mut cursor = Cursor::new(data);
+    let Ok(len) = cursor.u8() else {
+        return Vec::new();
+    };
+    cursor.take(len as usize).unwrap_or_default().to_vec()
+}
+
+fn parse_supported_versions(data: &[u8]) -> Vec<u16> {
+    parse_u8_prefixed_u16(data)
 }
 
 fn parse_key_share_groups(data: &[u8]) -> Vec<u16> {
@@ -275,17 +283,65 @@ fn build_ja4(tls: &TlsObservation) -> String {
     format!("{prefix}_{}_{}", sha256_12(&cipher_string), sha256_12(&c_string))
 }
 
-pub fn parse_client_hello(data: &[u8]) -> Result<TlsObservation, ClientHelloParseError> {
-    let mut record = Cursor::new(data);
-    let content_type = record.u8()?;
-    if content_type != 22 {
-        return Err(ClientHelloParseError::NotHandshake);
+fn collect_handshake(data: &[u8]) -> Result<(u16, usize, usize, Vec<u8>), ClientHelloParseError> {
+    let mut input = Cursor::new(data);
+    let mut handshake = Vec::new();
+    let mut first_record_version = None;
+    let mut record_count = 0usize;
+    let mut total_record_bytes = 0usize;
+    let mut expected_handshake = None;
+
+    while input.remaining() > 0 {
+        if input.remaining() < 5 {
+            return Err(ClientHelloParseError::Incomplete);
+        }
+
+        let content_type = input.u8()?;
+        let record_version = input.u16()?;
+        let record_len = input.u16()? as usize;
+        if content_type != 22 {
+            if record_count == 0 {
+                return Err(ClientHelloParseError::NotHandshake);
+            }
+            return Err(ClientHelloParseError::Incomplete);
+        }
+
+        let body = input.take(record_len)?;
+        first_record_version.get_or_insert(record_version);
+        record_count += 1;
+        total_record_bytes += 5 + record_len;
+        handshake.extend_from_slice(body);
+
+        if expected_handshake.is_none() && handshake.len() >= 4 {
+            if handshake[0] != 1 {
+                return Err(ClientHelloParseError::NotClientHello);
+            }
+            let len = ((handshake[1] as usize) << 16)
+                | ((handshake[2] as usize) << 8)
+                | handshake[3] as usize;
+            expected_handshake = Some(4 + len);
+        }
+
+        if let Some(expected) = expected_handshake {
+            if handshake.len() >= expected {
+                handshake.truncate(expected);
+                return Ok((
+                    first_record_version.unwrap_or(0),
+                    total_record_bytes,
+                    record_count,
+                    handshake,
+                ));
+            }
+        }
     }
 
-    let record_version = record.u16()?;
-    let record_len = record.u16()? as usize;
-    let record_body = record.take(record_len)?;
-    let mut handshake = Cursor::new(record_body);
+    Err(ClientHelloParseError::Incomplete)
+}
+
+pub fn parse_client_hello(data: &[u8]) -> Result<TlsObservation, ClientHelloParseError> {
+    let (record_version, record_bytes, record_count, handshake_bytes) = collect_handshake(data)?;
+    let raw_client_hello_hash = sha256_hex(&handshake_bytes);
+    let mut handshake = Cursor::new(&handshake_bytes);
 
     if handshake.u8()? != 1 {
         return Err(ClientHelloParseError::NotClientHello);
@@ -313,11 +369,14 @@ pub fn parse_client_hello(data: &[u8]) -> Result<TlsObservation, ClientHelloPars
     let mut observation = TlsObservation {
         record_version: Some(record_version),
         legacy_version: Some(legacy_version),
+        grease_cipher_count: cipher_suites.iter().filter(|value| is_grease(**value)).count(),
         cipher_suites,
         session_id_len: Some(session_id_len),
         compression_methods,
         client_hello_len: Some(client_hello_len),
-        record_len: Some(record_len),
+        record_len: Some(record_bytes),
+        record_count,
+        raw_client_hello_hash: Some(raw_client_hello_hash),
         ..TlsObservation::default()
     };
 
@@ -331,10 +390,18 @@ pub fn parse_client_hello(data: &[u8]) -> Result<TlsObservation, ClientHelloPars
             let extension_len = extensions.u16()? as usize;
             let extension_data = extensions.take(extension_len)?;
             observation.extensions.push(extension_type);
+            observation.extension_details.push(TlsExtensionObservation {
+                kind: extension_type,
+                length: extension_len,
+            });
+
+            if is_grease(extension_type) {
+                observation.grease_extension_count += 1;
+            }
 
             match extension_type {
                 0x0000 => observation.sni = parse_sni(extension_data),
-                0x000a => observation.supported_groups = parse_supported_groups(extension_data),
+                0x000a => observation.supported_groups = parse_u16_prefixed(extension_data),
                 0x000b => {
                     let mut cursor = Cursor::new(extension_data);
                     if let Ok(len) = cursor.u8() {
@@ -343,16 +410,31 @@ pub fn parse_client_hello(data: &[u8]) -> Result<TlsObservation, ClientHelloPars
                         }
                     }
                 }
-                0x000d => {
-                    observation.signature_algorithms = parse_signature_algorithms(extension_data)
-                }
+                0x000d => observation.signature_algorithms = parse_u16_prefixed(extension_data),
                 0x0010 => observation.alpn = parse_alpn(extension_data),
+                0x0015 => observation.padding_len = Some(extension_len),
+                0x001b => {
+                    observation.certificate_compression_algorithms = parse_u8_prefixed_u16(extension_data)
+                }
+                0x0023 => observation.has_session_ticket = true,
+                0x0029 => observation.has_pre_shared_key = true,
+                0x002a => observation.has_early_data = true,
                 0x002b => observation.supported_versions = parse_supported_versions(extension_data),
+                0x002d => observation.psk_key_exchange_modes = parse_u8_vector(extension_data),
+                0x0032 => observation.signature_algorithms_cert = parse_u16_prefixed(extension_data),
                 0x0033 => observation.key_share_groups = parse_key_share_groups(extension_data),
+                0x4469 => observation.has_alps = true,
+                0xfe0d => observation.has_ech = true,
                 _ => {}
             }
         }
     }
+
+    observation.grease_group_count = observation
+        .supported_groups
+        .iter()
+        .filter(|value| is_grease(**value))
+        .count();
 
     let ja3_ciphers = observation
         .cipher_suites
@@ -386,14 +468,14 @@ pub fn parse_client_hello(data: &[u8]) -> Result<TlsObservation, ClientHelloPars
         .join("-");
 
     let ja3_string = format!(
-        "{},{},{},{},{}",
-        legacy_version, ja3_ciphers, ja3_extensions, ja3_groups, ja3_points
+        "{legacy_version},{ja3_ciphers},{ja3_extensions},{ja3_groups},{ja3_points}"
     );
 
     observation.ja3 = Some(md5_hex(&ja3_string));
     observation.ja3_string = Some(ja3_string);
     observation.ja4 = Some(build_ja4(&observation));
     observation.stable_tls_fp = Some(fingerprint_tls_stable(&observation));
+    observation.wire_tls_fp = Some(fingerprint_tls_wire(&observation));
 
     Ok(observation)
 }
@@ -402,24 +484,15 @@ pub fn parse_client_hello(data: &[u8]) -> Result<TlsObservation, ClientHelloPars
 mod tests {
     use super::*;
 
-    #[test]
-    fn grease_detection_matches_reserved_pattern() {
-        assert!(is_grease(0x0a0a));
-        assert!(is_grease(0x1a1a));
-        assert!(is_grease(0xfafa));
-        assert!(!is_grease(0x1301));
+    fn extension(kind: u16, data: &[u8]) -> Vec<u8> {
+        let mut result = Vec::new();
+        result.extend_from_slice(&kind.to_be_bytes());
+        result.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        result.extend_from_slice(data);
+        result
     }
 
-    #[test]
-    fn parses_synthetic_client_hello_and_ignores_grease_in_ja_fingerprints() {
-        fn extension(kind: u16, data: &[u8]) -> Vec<u8> {
-            let mut result = Vec::new();
-            result.extend_from_slice(&kind.to_be_bytes());
-            result.extend_from_slice(&(data.len() as u16).to_be_bytes());
-            result.extend_from_slice(data);
-            result
-        }
-
+    fn synthetic_handshake() -> Vec<u8> {
         let mut extensions = Vec::new();
 
         let hostname = b"example.com";
@@ -429,12 +502,13 @@ mod tests {
         sni.extend_from_slice(&(hostname.len() as u16).to_be_bytes());
         sni.extend_from_slice(hostname);
         extensions.extend(extension(0x0000, &sni));
-
         extensions.extend(extension(0x000a, &[0x00, 0x04, 0x00, 0x1d, 0x0a, 0x0a]));
         extensions.extend(extension(0x000b, &[0x01, 0x00]));
         extensions.extend(extension(0x000d, &[0x00, 0x04, 0x04, 0x03, 0x08, 0x04]));
         extensions.extend(extension(0x0010, &[0x00, 0x03, 0x02, b'h', b'2']));
+        extensions.extend(extension(0x0015, &[0; 8]));
         extensions.extend(extension(0x002b, &[0x04, 0x03, 0x04, 0x03, 0x03]));
+        extensions.extend(extension(0x002d, &[0x01, 0x01]));
         extensions.extend(extension(0x0033, &[0x00, 0x06, 0x00, 0x1d, 0x00, 0x02, 0x01, 0x02]));
 
         let mut hello = Vec::new();
@@ -452,28 +526,70 @@ mod tests {
 
         let mut handshake = Vec::new();
         handshake.push(1);
-        let hello_len = hello.len();
-        handshake.push(((hello_len >> 16) & 0xff) as u8);
-        handshake.push(((hello_len >> 8) & 0xff) as u8);
-        handshake.push((hello_len & 0xff) as u8);
+        handshake.push(((hello.len() >> 16) & 0xff) as u8);
+        handshake.push(((hello.len() >> 8) & 0xff) as u8);
+        handshake.push((hello.len() & 0xff) as u8);
         handshake.extend_from_slice(&hello);
+        handshake
+    }
 
+    fn record(body: &[u8]) -> Vec<u8> {
         let mut record = Vec::new();
         record.push(22);
         record.extend_from_slice(&0x0301_u16.to_be_bytes());
-        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
-        record.extend_from_slice(&handshake);
+        record.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        record.extend_from_slice(body);
+        record
+    }
 
-        let parsed = parse_client_hello(&record).expect("ClientHello should parse");
+    #[test]
+    fn grease_detection_matches_reserved_pattern() {
+        assert!(is_grease(0x0a0a));
+        assert!(is_grease(0x1a1a));
+        assert!(is_grease(0xfafa));
+        assert!(!is_grease(0x1301));
+    }
+
+    #[test]
+    fn parses_client_hello_and_ignores_grease_in_ja_fingerprints() {
+        let bytes = record(&synthetic_handshake());
+        let parsed = parse_client_hello(&bytes).expect("ClientHello should parse");
+
         assert_eq!(parsed.sni.as_deref(), Some("example.com"));
         assert_eq!(parsed.alpn, vec!["h2"]);
         assert_eq!(parsed.supported_versions, vec![0x0304, 0x0303]);
         assert_eq!(parsed.key_share_groups, vec![0x001d]);
+        assert_eq!(parsed.grease_cipher_count, 1);
+        assert_eq!(parsed.grease_group_count, 1);
+        assert_eq!(parsed.padding_len, Some(8));
         assert_eq!(
             parsed.ja3_string.as_deref(),
-            Some("771,4865-4866,0-10-11-13-16-43-51,29,0")
+            Some("771,4865-4866,0-10-11-13-16-21-43-45-51,29,0")
         );
-        assert!(parsed.ja4.as_deref().unwrap_or_default().starts_with("t13d0207h2_"));
+        assert!(parsed.ja4.as_deref().unwrap_or_default().starts_with("t13d0209h2_"));
         assert!(parsed.stable_tls_fp.as_deref().unwrap_or_default().starts_with("ztls1_"));
+        assert!(parsed.wire_tls_fp.as_deref().unwrap_or_default().starts_with("ztlsw1_"));
+    }
+
+    #[test]
+    fn parses_client_hello_split_across_tls_records() {
+        let handshake = synthetic_handshake();
+        let split = handshake.len() / 2;
+        let mut bytes = record(&handshake[..split]);
+        bytes.extend(record(&handshake[split..]));
+
+        let parsed = parse_client_hello(&bytes).expect("fragmented ClientHello should parse");
+        assert_eq!(parsed.record_count, 2);
+        assert_eq!(parsed.sni.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn reports_incomplete_fragment() {
+        let handshake = synthetic_handshake();
+        let bytes = record(&handshake[..12]);
+        assert!(matches!(
+            parse_client_hello(&bytes),
+            Err(ClientHelloParseError::Incomplete)
+        ));
     }
 }
