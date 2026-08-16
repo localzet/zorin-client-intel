@@ -1,0 +1,12 @@
+/target/
+.env
+*.pem
+*.key
+*.crt
+*.p12
+.idea/
+.vscode/
+.DS_Store
+coverage/
+node_modules/
+*.log

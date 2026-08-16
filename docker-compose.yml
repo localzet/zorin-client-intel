@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: zci
+      POSTGRES_USER: zci
+      POSTGRES_PASSWORD: zci
+    volumes:
+      - zci-postgres:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zci -d zci"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  collector:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ZCI_BIND: 0.0.0.0:8443
+      ZCI_HTTP_BIND: 0.0.0.0:8080
+      ZCI_TLS_CERT: /certs/cert.pem
+      ZCI_TLS_KEY: /certs/key.pem
+      DATABASE_URL: postgres://zci:zci@postgres:5432/zci
+      RUST_LOG: client_intel_collector=debug,tower_http=info
+      TRUST_PROXY_HEADERS: "false"
+    volumes:
+      - ./certs:/certs:ro
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+
+volumes:
+  zci-postgres:

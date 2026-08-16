@@ -1,0 +1,37 @@
+[workspace]
+members = [
+    "crates/client-intel-core",
+    "services/collector",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+authors = ["Ivan Zorin <creator@localzet.com>"]
+license = "Proprietary"
+rust-version = "1.88"
+
+[workspace.dependencies]
+axum = { version = "0.8.8", features = ["json", "macros"] }
+base64 = "0.22.1"
+chrono = { version = "0.4.42", features = ["serde"] }
+hex = "0.4.3"
+http = "1.3.1"
+hyper = { version = "1.8.1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1.20", features = ["http1", "http2", "server", "service", "tokio"] }
+md-5 = "0.10.6"
+once_cell = "1.21.3"
+rustls = "0.23.35"
+rustls-pemfile = "2.2.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.10.9"
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
+thiserror = "2.0.17"
+tokio = { version = "1.51.1", features = ["full"] }
+tokio-rustls = "0.26.4"
+tower = { version = "0.5.2", features = ["util"] }
+tower-http = { version = "0.6.11", features = ["cors", "trace"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+uuid = { version = "1.24.0", features = ["v4", "serde"] }
